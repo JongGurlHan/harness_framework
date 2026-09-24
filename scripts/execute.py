@@ -126,6 +126,8 @@ class InvokeResult:
     exit_code: int
     timed_out: bool
     stderr: str
+    cost_usd: float = 0.0  # 타임아웃으로 죽은 세션은 결과 JSON이 없어 0으로 남는다
+    num_turns: int = 0
 
 
 class StepExecutor:
@@ -159,6 +161,8 @@ class StepExecutor:
         self._total = len(idx["steps"])
         self._model = model or idx.get("model")
         self._timeout = idx.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
+        # 무인 세션에는 대화용 MCP 커넥터(claude.ai Drive 등)가 필요 없는 경우가 대부분이라 기본은 격리
+        self._mcp = bool(idx.get("mcp", False))
         self._branch = f"feat-{self._phase_name}"
 
     def run(self, *, reset_failed: bool = False):
@@ -378,10 +382,18 @@ class StepExecutor:
         cmd = [resolve_claude_bin(), "-p", "--dangerously-skip-permissions", "--output-format", "json"]
         if self._model:
             cmd += ["--model", self._model]
+        if not self._mcp:
+            cmd += ["--strict-mcp-config"]
         cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
 
         exit_code, stdout, stderr, timed_out = run_killing_tree(
             cmd, input=prompt, cwd=self._root, timeout=self._timeout)
+
+        usage = {}
+        with contextlib.suppress(ValueError, AttributeError):
+            usage = json.loads(stdout)
+        if not isinstance(usage, dict):
+            usage = {}
 
         if exit_code != 0:
             print(f"\n  WARN: Claude 비정상 종료 (code {exit_code}{', timeout' if timed_out else ''})")
@@ -392,7 +404,9 @@ class StepExecutor:
             "sessionId": session_id, "resumed": resume, "exitCode": exit_code, "timedOut": timed_out,
             "stdout": stdout, "stderr": stderr,
         })
-        return InvokeResult(exit_code, timed_out, stderr)
+        return InvokeResult(exit_code, timed_out, stderr,
+                            cost_usd=float(usage.get("total_cost_usd") or 0.0),
+                            num_turns=int(usage.get("num_turns") or 0))
 
     # --- 검증 ---
 
@@ -440,7 +454,8 @@ class StepExecutor:
     def _print_header(self):
         print(f"\n{'='*60}")
         print("  Harness Step Executor")
-        print(f"  Phase: {self._phase_name} | Steps: {self._total} | Model: {self._model or 'default'}")
+        print(f"  Phase: {self._phase_name} | Steps: {self._total} | Model: {self._model or 'default'}"
+              f" | MCP: {'on' if self._mcp else 'off'}")
         if self._auto_push:
             print("  Auto-push: enabled")
         print(f"{'='*60}")
@@ -503,6 +518,13 @@ class StepExecutor:
         self._commit_step(step_num, step_name, kind="wip")
         self._update_top_index(status)
 
+    def _add_usage(self, step_num: int, inv: InvokeResult) -> float:
+        """시도별 비용·턴 수를 step에 누적한다 (재시작·재시도 포함). 누적 비용을 반환한다."""
+        s = next(s for s in self._read_json(self._index_file)["steps"] if s["step"] == step_num)
+        cost = round(s.get("cost_usd", 0.0) + inv.cost_usd, 4)
+        self._update_step(step_num, cost_usd=cost, num_turns=s.get("num_turns", 0) + inv.num_turns)
+        return cost
+
     def _execute_single_step(self, step: dict):
         step_num, step_name = step["step"], step["name"]
         index = self._read_json(self._index_file)
@@ -542,6 +564,7 @@ class StepExecutor:
                                  and not self._result_file(step_num).exists())
                 status, feedback, result = self._verify(step, inv)
             elapsed = int(pi.elapsed)
+            cost = self._add_usage(step_num, inv)
 
             if status == "completed":
                 self._update_step(step_num, status="completed", summary=result.get("summary", ""),
@@ -549,7 +572,7 @@ class StepExecutor:
                                   completed_at=self._stamp(), attempts=attempt)
                 self._result_file(step_num).unlink(missing_ok=True)
                 self._commit_step(step_num, step_name)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s, ${cost:.2f}]")
                 return
 
             if status == "blocked":
@@ -583,7 +606,9 @@ class StepExecutor:
             print(f"\n  ERROR: Step {s['step']} ({s['name']})이 '{s['status']}' 상태라 phase를 완료 처리할 수 없습니다.")
             sys.exit(1)
 
-        print("\n  All steps completed!")
+        index["cost_usd"] = round(sum(s.get("cost_usd", 0.0) for s in index["steps"]), 4)
+        index["num_turns"] = sum(s.get("num_turns", 0) for s in index["steps"])
+        print(f"\n  All steps completed! (총 비용 ${index['cost_usd']:.2f}, {index['num_turns']} turns)")
         index["completed_at"] = self._stamp()
         self._write_json(self._index_file, index)
         self._update_top_index("completed")

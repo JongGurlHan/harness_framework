@@ -75,6 +75,7 @@
 - `steps[].skip_ac` (예외): 검증할 커맨드가 정말 없는 step(문서만 수정 등)은 `"skip_ac": "사유"`를 명시한다. 이때도 세션이 정상 종료(exit 0, 타임아웃 아님)해야 완료로 인정한다.
 - `model` (선택): `claude --model` 값. 생략하면 CLI 기본값. `--model` 인자가 우선한다.
 - `timeout_sec` (선택): 세션 1회와 AC 커맨드 1개의 제한 시간. 기본 3600.
+- `mcp` (선택): 기본 `false` — 세션에 MCP 서버를 로드하지 않는다(`--strict-mcp-config`). 무인 세션에 대화용 커넥터(claude.ai Drive 등)는 불필요한 도구 정의만 늘리기 때문이다. step이 MCP 도구를 써야 하면 `true`.
 
 상태 전이와 자동 기록 필드:
 
@@ -89,6 +90,8 @@ index.json은 **execute.py만 수정한다.** Claude 세션은 `step{N}-result.j
 `summary`(한 줄)와 `handoff`(결정 사항·바뀐 인터페이스·남은 이슈, 10줄 이내)는 다음 step 프롬프트에 누적 전달된다.
 
 `created_at`, `started_at`, `model`, `attempts`, `session_id`도 execute.py가 기록한다. 생성 시 넣지 않는다.
+
+비용: step마다 `cost_usd`, `num_turns`를 시도·재시작에 걸쳐 누적하고, phase 완료 시 task 레벨에 합계를 기록한다. 타임아웃으로 강제 종료된 시도는 CLI가 결과를 내지 못해 비용이 집계되지 않는다(실제 비용보다 적게 나올 수 있다).
 
 #### D-3. `phases/{task-name}/step{N}.md` (각 step마다 1개)
 
@@ -137,7 +140,7 @@ execute.py가 자동으로 처리하는 것:
 - 중단 복구 — 하네스가 도중에 죽었다면 그냥 다시 실행한다. pending step에 남은 `session_id`로 세션을 이어받는다
 - 타임아웃 — 세션과 AC 커맨드가 `timeout_sec`을 넘으면 자식 프로세스(npm, 테스트 러너 등)까지 모두 종료한다
 - 커밋 — 세션은 커밋하지 않는다. 코드(`feat`)와 메타데이터(`chore`)를 분리 커밋하고, error/blocked 시 중간 결과는 `wip`로 커밋
-- 기록 — 시도별 CLI 출력을 `step{N}-attempt{K}-output.json`에 저장 (gitignore)
+- 기록 — 시도별 CLI 출력을 `step{N}-attempt{K}-output.json`에 저장 (gitignore). step별·phase 전체 비용과 턴 수를 index.json에 기록
 
 에러 복구:
 

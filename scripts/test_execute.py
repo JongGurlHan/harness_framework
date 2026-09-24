@@ -118,6 +118,13 @@ class TestInit:
     def test_defaults(self, executor):
         assert executor._model is None
         assert executor._timeout == ex.DEFAULT_TIMEOUT_SEC
+        assert executor._mcp is False
+
+    def test_reads_mcp_from_index(self, tmp_project):
+        d = tmp_project / "phases" / "cfg"
+        d.mkdir()
+        write_json(d / "index.json", {"project": "P", "phase": "cfg", "mcp": True, "steps": []})
+        assert ex.StepExecutor("cfg", root=tmp_project)._mcp is True
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +291,27 @@ class TestInvokeClaude:
         data = read_json(executor._phase_dir / "step2-attempt1-output.json")
         assert data["step"] == 2 and data["exitCode"] == 0 and data["sessionId"] == "sid-1"
 
+    def test_parses_cost_and_turns(self, executor):
+        stdout = '{"result": "ok", "total_cost_usd": 0.2008, "num_turns": 9}'
+        with patch.object(ex, "run_killing_tree", return_value=(0, stdout, "", False)):
+            res = executor._invoke_claude(2, "P", attempt=1, session_id="s")
+        assert res.cost_usd == pytest.approx(0.2008) and res.num_turns == 9
+
+    def test_missing_cost_is_zero(self, executor):
+        # 타임아웃으로 죽은 세션은 결과 JSON이 없다
+        with patch.object(ex, "run_killing_tree", return_value=(-1, "", "", True)):
+            res = executor._invoke_claude(2, "P", attempt=1, session_id="s")
+        assert res.cost_usd == 0.0 and res.num_turns == 0
+
+    def test_mcp_isolated_by_default(self, executor):
+        _, mock_run = self._run(executor)
+        assert "--strict-mcp-config" in mock_run.call_args[0][0]
+
+    def test_mcp_opt_in(self, executor):
+        executor._mcp = True
+        _, mock_run = self._run(executor)
+        assert "--strict-mcp-config" not in mock_run.call_args[0][0]
+
 
 # ---------------------------------------------------------------------------
 # 검증
@@ -429,10 +457,33 @@ class TestExecuteSingleStep:
             run = runs[len(calls) - 1]
             if run.get("result") is not None:
                 write_json(executor._result_file(step_num), run["result"])
-            return ex.InvokeResult(exit_code=run.get("exit", 0), timed_out=run.get("timeout", False), stderr="")
+            return ex.InvokeResult(exit_code=run.get("exit", 0), timed_out=run.get("timeout", False), stderr="",
+                                   cost_usd=run.get("cost", 0.0), num_turns=run.get("turns", 0))
 
         executor._invoke_claude = fake
         return calls
+
+    def test_accumulates_cost_and_turns_across_attempts(self, executor):
+        self._fake_invoke(executor, [dict(self.OK, cost=0.25, turns=9), dict(self.OK, cost=0.125, turns=3)])
+        with patch.object(executor, "_run_ac", side_effect=[(False, "AC 실패: x"), (True, "")]):
+            executor._execute_single_step(self._step(executor))
+        s = read_json(executor._index_file)["steps"][2]
+        assert s["cost_usd"] == pytest.approx(0.375) and s["num_turns"] == 12
+
+    def test_cost_recorded_even_when_step_fails(self, executor):
+        self._fake_invoke(executor, [dict(self.OK, cost=0.5, turns=1)] * 3)
+        with patch.object(executor, "_run_ac", return_value=(False, "AC 실패: x")):
+            with pytest.raises(SystemExit):
+                executor._execute_single_step(self._step(executor))
+        assert read_json(executor._index_file)["steps"][2]["cost_usd"] == pytest.approx(1.5)
+
+    def test_cost_accumulates_on_top_of_previous_runs(self, executor):
+        executor._update_step(2, cost_usd=1.0, num_turns=5)
+        self._fake_invoke(executor, [dict(self.OK, cost=0.5, turns=2)])
+        with patch.object(executor, "_run_ac", return_value=(True, "")):
+            executor._execute_single_step(self._step(executor))
+        s = read_json(executor._index_file)["steps"][2]
+        assert s["cost_usd"] == pytest.approx(1.5) and s["num_turns"] == 7
 
     def _step(self, executor):
         return read_json(executor._index_file)["steps"][2]
@@ -611,6 +662,18 @@ class TestFinalize:
             inst._finalize()
         assert e.value.code == 1
         assert "completed_at" not in read_json(inst._index_file)
+
+    def test_records_phase_cost_total(self, tmp_project, capsys):
+        inst = make_executor(tmp_project, [
+            {"step": 0, "name": "a", "status": "completed", "cost_usd": 0.2, "num_turns": 9},
+            {"step": 1, "name": "b", "status": "completed", "cost_usd": 0.3, "num_turns": 6},
+            {"step": 2, "name": "c", "status": "completed"},
+        ])
+        inst._run_git = MagicMock(return_value=MagicMock(returncode=0))
+        inst._finalize()
+        idx = read_json(inst._index_file)
+        assert idx["cost_usd"] == pytest.approx(0.5) and idx["num_turns"] == 15
+        assert "$0.50" in capsys.readouterr().out
 
     def test_marks_completed(self, tmp_project, top_index):
         d = tmp_project / "phases" / "0-mvp"
