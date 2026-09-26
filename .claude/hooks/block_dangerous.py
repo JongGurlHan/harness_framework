@@ -12,13 +12,20 @@ import json
 import re
 import sys
 
+# 옵션은 같은 단순 명령 안에서만 본다 (; & | 줄바꿈에서 끊는다). 순서·묶음(-rf, -f -r)·긴 이름을 모두 잡는다.
+SEG = r"[^;&|\n]*"
+END = r"(?=[\s;&|)]|$)"  # 옵션 바로 뒤에 구분자가 붙어도(-f; -f| -f)) 옵션의 끝으로 본다
+ARG = r"""(?:"[^"]*"|'[^']*'|\S+)"""  # 따옴표로 묶인 인자는 공백을 포함한다
+GIT = rf"\bgit(?:\s+(?:-[Cc]\s+{ARG}|-[^\s=]+(?:={ARG})?))*\s+"  # -C path, -c k=v, --no-pager 같은 전역 옵션을 건너뛴다
+RECURSIVE = rf"\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive){END}"
+FORCE = rf"\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force[^\s;&|)]*){END}"
+
 PATTERNS = [
-    (r"\brm\s+(-\S+\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f", "rm -rf"),
-    (r"\brm\s+(-\S+\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]", "rm -rf"),
-    (r"\brm\s+.*(-r|-R|--recursive)\b.*\s(-f|--force)\b", "rm -r -f"),
-    (r"\bgit\s+push\b.*\s(--force\S*|-f)\b", "git push --force"),
-    (r"\bgit\s+reset\s+.*--hard\b|\bgit\s+reset\s+--hard\b", "git reset --hard"),
-    (r"\bgit\s+clean\s+(-\S+\s+)*-[a-zA-Z]*f", "git clean -f"),
+    (rf"\brm\b(?={SEG}{RECURSIVE})(?={SEG}{FORCE})", "rm -rf"),
+    (rf"{GIT}push\b(?={SEG}(?:{FORCE}|\s\+\S))", "git push --force"),  # +refspec 도 강제 push 다
+    (rf"{GIT}reset\b(?={SEG}\s--hard\b)", "git reset --hard"),
+    (rf"{GIT}clean\b(?={SEG}{FORCE})", "git clean -f"),
+    (rf"(?i)\b(?:rd|rmdir)\b(?={SEG}\s/s\b)", "rd /s"),
     (r"(?i)\bdrop\s+(table|database|schema)\b", "DROP TABLE/DATABASE"),
 ]
 

@@ -5,6 +5,9 @@ Harness Step Executor — phase 내 step을 순차 실행하고, 완료 여부�
 Usage:
     python scripts/execute.py <phase-dir> [--push] [--model MODEL] [--reset-failed]
 
+Tests:
+    python -m pytest scripts
+
 흐름:
     step마다 claude -p 세션을 띄우고, 세션은 step{N}-result.json에 결과를 보고한다.
     하네스는 그 보고와 step의 AC 커맨드 실행 결과를 보고 상태를 확정한다.
@@ -14,6 +17,7 @@ Usage:
 
 import argparse
 import contextlib
+import fnmatch
 import json
 import os
 import shutil
@@ -32,6 +36,9 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TIMEOUT_SEC = 3600
 FEEDBACK_TAIL = 3000
+SECRET_GLOBS = (".env", ".env.*", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ecdsa*", "id_ed25519*")
+SECRET_ALLOW = (".env.example", ".env.sample", ".env.template")
+STEP_STATUSES = ("pending", "completed", "error", "blocked")
 
 
 @contextlib.contextmanager
@@ -77,6 +84,24 @@ def resolve_claude_bin() -> str:
     return found
 
 
+def resolve_ac_shell(is_windows: bool = os.name == "nt") -> Optional[str]:
+    """Windows 에서 AC 를 실행할 Git Bash 경로. 세션은 Bash 도구(Git Bash)로 AC 를 확인하므로 하네스도 같은 셸로
+    검증한다 — cmd.exe 로 돌리면 `FOO=1 npm test` 같은 커맨드가 세션에선 통과하고 하네스에선 실패한다.
+    POSIX 는 None (/bin/sh). PATH 의 bash 는 WSL 런처일 수 있어 git 설치 위치에서 찾는다."""
+    if not is_windows:
+        return None
+    override = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if override:
+        return override if Path(override).is_file() else None  # 없는 경로면 AC 실행 때 죽는다
+    found = shutil.which("git")
+    if found:
+        for d in list(Path(found).parents)[:3]:  # Git\cmd\git.exe, Git\mingw64\bin\git.exe
+            bash = d / "bin" / "bash.exe"
+            if bash.exists():
+                return str(bash)
+    return None
+
+
 def dirty_paths_outside_phases(porcelain: str) -> list:
     """`git status --porcelain` 출력에서 phases/ 밖의 변경 경로만 추린다."""
     paths = []
@@ -87,6 +112,34 @@ def dirty_paths_outside_phases(porcelain: str) -> list:
         if not path.startswith("phases/"):
             paths.append(path)
     return paths
+
+
+def is_secret_path(path: str) -> bool:
+    """자동 커밋에서 빼야 할 비밀값 파일인가. .gitignore 는 대상 프로젝트마다 달라서 하네스가 한 번 더 거른다."""
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    return name not in SECRET_ALLOW and any(fnmatch.fnmatch(name, g) for g in SECRET_GLOBS)
+
+
+def parse_result(data) -> tuple:
+    """세션이 쓴 step{N}-result.json 을 검증·정규화한다. (result, problem) — 문제가 있으면 result 는 None.
+    세션 출력은 믿을 수 없는 입력이다. 형태가 틀리면 하네스가 죽지 말고 세션에 다시 쓰게 한다.
+    문자열 배열로 쓴 텍스트 필드는 줄바꿈으로 합친다 (모델이 '10줄 이내'를 배열로 쓰는 경우가 흔하다)."""
+    if not isinstance(data, dict):
+        return None, f"JSON 객체여야 하는데 {type(data).__name__}이다"
+    status = data.get("status")
+    if status not in ("completed", "blocked", "error"):
+        return None, f"status 는 completed/blocked/error 중 하나여야 한다 (받은 값: {status!r})"
+    result = {"status": status}
+    for key in ("summary", "handoff", "reason"):
+        value = data.get(key)
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            value = "\n".join(value)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None, f"{key} 는 문자열이어야 한다 (받은 값: {type(value).__name__})"
+        result[key] = value.strip()
+    return result, ""
 
 
 def _tail(text: str, n: int = FEEDBACK_TAIL) -> str:
@@ -119,6 +172,11 @@ def run_killing_tree(cmd, *, cwd: str, timeout: int, input: Optional[str] = None
             proc.kill()
             out, err = "", ""
         return -1, out or "", err or "", True
+    except BaseException:
+        # Ctrl+C·SIGTERM 으로 하네스가 멈추면 세션도 멈춰야 한다. 안 그러면 무인 세션이 계속 파일을 고친다.
+        # POSIX 에서는 자식이 별도 세션이라 터미널 Ctrl+C 가 자식에게 전달되지 않는다.
+        _kill_tree(proc)
+        raise
 
 
 @dataclass
@@ -151,28 +209,44 @@ class StepExecutor:
             sys.exit(1)
 
         self._index_file = self._phase_dir / "index.json"
+        self._model_override = model
+        self._load_config()
+        self._ac_shell = resolve_ac_shell()
+
+    def _load_config(self):
+        """phase index.json 에서 실행 설정을 읽는다. 브랜치를 전환한 뒤 그 브랜치의 파일로 다시 읽는다."""
         if not self._index_file.exists():
             print(f"ERROR: {self._index_file} not found")
             sys.exit(1)
-
         idx = self._read_json(self._index_file)
+        if not isinstance(idx, dict):
+            print(f"ERROR: {self._index_file} 는 JSON 객체여야 합니다.")
+            sys.exit(1)
         self._project = idx.get("project", "project")
-        self._phase_name = idx.get("phase", phase_dir_name)
-        self._total = len(idx["steps"])
-        self._model = model or idx.get("model")
+        self._phase_name = idx.get("phase", self._phase_dir_name)
+        self._total = len(idx.get("steps") or [])
+        self._model = self._model_override or idx.get("model")
         self._timeout = idx.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
+        self._max_cost = idx.get("max_cost_usd")  # phase 누적 비용 상한 (선택)
+        self._step_max_cost = idx.get("step_max_cost_usd")  # step 누적 비용 상한 (선택)
         # 무인 세션에는 대화용 MCP 커넥터(claude.ai Drive 등)가 필요 없는 경우가 대부분이라 기본은 격리
         self._mcp = bool(idx.get("mcp", False))
         self._branch = f"feat-{self._phase_name}"
 
-    def run(self, *, reset_failed: bool = False):
+    def run(self, *, reset_failed: bool = False, resume: bool = False):
         self._print_header()
+        self._ensure_clean_tree(resume)
+        self._checkout_branch()
+        # 검증·초기화는 실제로 실행할 브랜치의 index.json 으로 한다
+        branch = self._branch
+        self._load_config()
+        if self._branch != branch:
+            print(f"  ERROR: '{branch}' 브랜치의 index.json 은 phase 이름이 다릅니다 ({self._phase_name}).")
+            sys.exit(1)
+        self._validate_index()
         if reset_failed:
             self._reset_failed()
         self._check_blockers()
-        self._validate_ac()
-        self._ensure_clean_tree()
-        self._checkout_branch()
         self._commit_plan_files()
         self._ensure_created_at()
         self._execute_all_steps()
@@ -188,8 +262,24 @@ class StepExecutor:
         return json.loads(p.read_text(encoding="utf-8"))
 
     @staticmethod
+    def _replace_file(p: Path, data: bytes):
+        """임시 파일에 쓴 뒤 교체한다. 쓰는 도중 죽어도 index.json 이 비거나 잘린 채 남지 않는다."""
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, p)
+
+    @staticmethod
     def _write_json(p: Path, data: dict):
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        StepExecutor._replace_file(p, json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))
+
+    def _restore_index_if_changed(self, snapshot: bytes):
+        """index.json 은 하네스만 쓴다. 세션이 고쳤으면 세션 직전 상태로 되돌린다.
+        그대로 두면 세션이 뒤 step 을 completed 로 바꾸거나 ac 를 지워, 그 step 이 실행도 AC 검증도 없이 넘어간다.
+        세션이 도는 동안 사람이 고친 내용도 함께 되돌려진다 — index.json 은 하네스를 멈춘 뒤 고친다."""
+        current = self._index_file.read_bytes() if self._index_file.exists() else None
+        if current != snapshot:
+            self._replace_file(self._index_file, snapshot)
+            print(f"\n  WARN: 세션이 {self._index_file.name} 을 수정했습니다. 하네스가 기록한 상태로 되돌렸습니다.")
 
     def _update_step(self, step_num: int, **fields):
         """index.json의 한 step을 갱신한다. 값이 None인 필드는 삭제한다."""
@@ -209,25 +299,94 @@ class StepExecutor:
         return subprocess.run(["git", *args], cwd=self._root, capture_output=True,
                               text=True, encoding="utf-8", errors="replace")
 
-    def _git_commit(self, msg: str):
-        r = self._run_git("commit", "-m", msg)
+    @staticmethod
+    def _git_failed(args: tuple, r: subprocess.CompletedProcess):
+        print(f"\n  ERROR: git {' '.join(args)} 실패 (exit {r.returncode})")
+        print(f"  {(r.stderr or r.stdout).strip()}")
+        sys.exit(1)
+
+    def _git(self, *args) -> subprocess.CompletedProcess:
+        """실패하면 멈추는 git. 스테이징·커밋이 조용히 실패하면 커밋되지 않은 step 이 completed 로 기록된다
+        (예: 타임아웃으로 죽은 세션의 git 이 남긴 .git/index.lock)."""
+        r = self._run_git(*args)
         if r.returncode != 0:
-            print(f"  ERROR: 커밋 실패 — {msg}")
-            print(f"  {(r.stderr or r.stdout).strip()}")
-            sys.exit(1)
+            self._git_failed(args, r)
+        return r
+
+    def _has_staged(self) -> bool:
+        """스테이징된 변경이 있는가. git diff --quiet 는 0=없음, 1=있음, 그 외=오류다."""
+        args = ("diff", "--cached", "--quiet")
+        r = self._run_git(*args)
+        if r.returncode not in (0, 1):
+            self._git_failed(args, r)
+        return r.returncode == 1
+
+    def _git_commit(self, msg: str):
+        self._git("commit", "-m", msg)
         print(f"  Commit: {msg}")
 
-    def _ensure_clean_tree(self):
-        """phases/ 밖에 커밋되지 않은 변경이 있으면 중단한다. 자동 커밋에 섞이는 것을 막기 위함."""
-        r = self._run_git("status", "--porcelain")
+    def _current_branch(self) -> str:
+        return self._run_git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+    def _head(self) -> str:
+        return self._run_git("rev-parse", "HEAD").stdout.strip()
+
+    def _undo_session_git(self, pre_head: str) -> Optional[str]:
+        """'세션은 커밋하지 않는다'를 하네스가 강제한다. 세션이 만든 커밋은 soft reset 으로 되돌려 변경만 남기고
+        (커밋은 하네스가 step 단위로 다시 한다), 브랜치를 바꿨으면 phase 브랜치로 돌아온 뒤 실패 사유를 돌려준다."""
+        if not pre_head:
+            return None
+        branch = self._current_branch()
+        if branch != self._branch:
+            r = self._run_git("checkout", self._branch)
+            if r.returncode != 0:
+                print(f"\n  ERROR: 세션이 브랜치를 '{branch}'(으)로 바꿨고 '{self._branch}'로 돌아가지 못했습니다.")
+                print(f"  {r.stderr.strip()}")
+                sys.exit(1)
+            return f"세션이 브랜치를 '{branch}'(으)로 바꿨다. 그 브랜치에 남은 변경·커밋을 확인하라."
+        if self._head() != pre_head:
+            self._git("reset", "-q", "--soft", pre_head)
+            print("\n  WARN: 세션이 직접 커밋했습니다. 커밋은 되돌리고 변경은 하네스가 다시 커밋합니다.")
+        return None
+
+    def _interrupted_step(self) -> Optional[dict]:
+        """이전 실행이 세션 도중 끊긴 step. pending 인데 session_id 가 남아 있다."""
+        steps = self._read_json(self._index_file).get("steps") or []  # 검증 전이라 형태를 가정하지 않는다
+        return next((s for s in steps if isinstance(s, dict)
+                     and s.get("status") == "pending" and s.get("session_id")), None)
+
+    @staticmethod
+    def _print_paths(paths: list, limit: int = 20):
+        for p in paths[:limit]:
+            print(f"    {p}")
+        if len(paths) > limit:
+            print(f"    … 외 {len(paths) - limit}개")
+
+    def _ensure_clean_tree(self, resume: bool = False):
+        """phases/ 밖에 커밋되지 않은 변경이 있으면 중단한다. 자동 커밋에 섞이는 것을 막기 위함.
+        phase 브랜치에서 중단된 step 이 남긴 변경은 --resume 으로 확인받은 뒤에만 이어받는다.
+        중단 뒤에 사용자가 만든 변경과 하네스가 구분할 방법이 없어서다."""
+        r = self._run_git("status", "--porcelain", "--untracked-files=all")
         if r.returncode != 0:
             return  # git 미사용은 _checkout_branch 에서 처리
         dirty = dirty_paths_outside_phases(r.stdout)
-        if dirty:
-            print("  ERROR: phases/ 밖에 커밋되지 않은 변경이 있습니다. commit 또는 stash 후 다시 실행하세요.")
-            for p in dirty[:20]:
-                print(f"    {p}")
+        if not dirty:
+            return
+        interrupted = self._interrupted_step()
+        if interrupted and self._current_branch() == self._branch:
+            label = f"Step {interrupted['step']} ({interrupted['name']})"
+            if resume:
+                print(f"  Resume: 중단된 {label}의 작업으로 보고 다음 변경을 이어받습니다.")
+                self._print_paths(dirty)
+                return
+            print(f"  ERROR: 중단된 {label}이 남긴 것으로 보이는 변경이 있습니다.")
+            self._print_paths(dirty)
+            print(f"  모두 세션 작업이면 이어받으세요: python scripts/execute.py {self._phase_dir_name} --resume")
+            print("  직접 수정한 파일이 섞여 있으면 그 파일을 먼저 stash 하거나 옮기세요.")
             sys.exit(1)
+        print("  ERROR: phases/ 밖에 커밋되지 않은 변경이 있습니다. commit 또는 stash 후 다시 실행하세요.")
+        self._print_paths(dirty)
+        sys.exit(1)
 
     def _checkout_branch(self):
         r = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
@@ -250,21 +409,36 @@ class StepExecutor:
         print(f"  Branch: {self._branch}")
 
     def _commit_plan_files(self):
-        """아직 커밋되지 않은 phase 계획 파일을 먼저 커밋해 step 커밋과 분리한다."""
-        self._run_git("add", "--", "phases")
-        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+        """아직 커밋되지 않은 phase 계획 파일을 먼저 커밋해 step 커밋과 분리한다.
+        인덱스에는 phases/ 만 남긴다. 중단된 세션의 작업이 스테이징돼 있어도 계획 커밋에 섞이지 않는다."""
+        self._git("reset", "-q", "HEAD", "--", ".", ":(exclude)phases")
+        self._stage("phases")
+        if self._has_staged():
             self._git_commit(f"chore({self._phase_name}): phase plan")
 
-    def _commit_step(self, step_num: int, step_name: str, kind: str = "feat"):
-        """코드 변경(feat/wip)과 메타데이터(chore)를 분리 커밋한다."""
+    def _stage(self, *pathspec: str):
+        """변경을 스테이징하되, 비밀값으로 보이는 파일의 추가·수정은 빼고 경고한다.
+        삭제는 그대로 둔다 — 비밀값을 저장소에서 치우는 변경이다. 모든 커밋은 이 함수를 거친다."""
+        self._git("add", "-A", "--", *(pathspec or (".",)))
+        staged = self._git("diff", "--cached", "--name-only", "--diff-filter=d", "-z").stdout or ""
+        secrets = [p for p in staged.split("\0") if p and is_secret_path(p)]
+        if secrets:
+            self._git("reset", "-q", "HEAD", "--", *secrets)
+            print(f"  WARN: 비밀값으로 보이는 파일을 커밋에서 뺐습니다: {', '.join(secrets)}")
+            print("        .gitignore 에 추가하세요. 그대로 두면 다음 실행이 작업 트리 검사에서 멈춥니다.")
+
+    def _commit_code(self, step_num: int, step_name: str, kind: str):
+        """세션이 만든 변경을 feat/wip 으로 커밋한다. phase index.json 은 상태를 기록한 뒤 _commit_meta 가 커밋한다.
+        코드를 먼저 커밋해야, 상태 기록 전에 죽어도 step 이 pending+session_id 로 남아 재개된다."""
         index_rel = f"phases/{self._phase_dir_name}/index.json"
-        self._run_git("add", "-A")
-        self._run_git("reset", "-q", "HEAD", "--", index_rel)
-        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+        self._stage()
+        self._git("reset", "-q", "HEAD", "--", index_rel)
+        if self._has_staged():
             self._git_commit(f"{kind}({self._phase_name}): step {step_num} — {step_name}")
 
-        self._run_git("add", "-A")
-        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+    def _commit_meta(self, step_num: int):
+        self._stage()
+        if self._has_staged():
             self._git_commit(f"chore({self._phase_name}): step {step_num} output")
 
     # --- top-level index ---
@@ -305,9 +479,9 @@ class StepExecutor:
     def _build_step_context(index: dict) -> str:
         lines = []
         for s in index["steps"]:
-            if s["status"] != "completed" or not s.get("summary"):
+            if s["status"] != "completed" or not (s.get("summary") or s.get("handoff")):
                 continue
-            lines.append(f"- Step {s['step']} ({s['name']}): {s['summary']}")
+            lines.append(f"- Step {s['step']} ({s['name']}): {s.get('summary') or '(요약 없음)'}")
             if s.get("handoff"):
                 lines += [f"    {l}" for l in s["handoff"].splitlines()]
         if not lines:
@@ -329,7 +503,8 @@ class StepExecutor:
         ac = step.get("ac") or []
         ac_section = (
             "## Acceptance Criteria\n\n"
-            "완료를 보고하기 전에 직접 실행해 통과를 확인하라. 하네스가 종료 후 같은 커맨드로 다시 검증한다.\n\n"
+            "완료를 보고하기 전에 직접 실행해 통과를 확인하라. 하네스가 종료 후 같은 커맨드를 "
+            f"`{self._ac_shell_label()}`로 다시 실행해 검증한다.\n\n"
             "```bash\n" + "\n".join(ac) + "\n```\n\n"
         ) if ac else ""
 
@@ -376,6 +551,13 @@ class StepExecutor:
 
     # --- Claude 호출 ---
 
+    def _next_log_path(self, step_num: int) -> Path:
+        """step{N}-attempt{K}-output.json. K 는 실행을 넘어 이어진다 — 재실행이 이전 실패의 로그를 덮어쓰지 않게."""
+        k = 1
+        while (p := self._phase_dir / f"step{step_num}-attempt{k}-output.json").exists():
+            k += 1
+        return p
+
     def _invoke_claude(self, step_num: int, prompt: str, *, attempt: int,
                        session_id: str, resume: bool = False) -> InvokeResult:
         """session_id 는 하네스가 미리 발급한 값. resume=False 면 그 ID로 새 세션을 만든다."""
@@ -398,9 +580,8 @@ class StepExecutor:
         if exit_code != 0:
             print(f"\n  WARN: Claude 비정상 종료 (code {exit_code}{', timeout' if timed_out else ''})")
 
-        out_path = self._phase_dir / f"step{step_num}-attempt{attempt}-output.json"
-        self._write_json(out_path, {
-            "step": step_num, "attempt": attempt, "model": self._model,
+        self._write_json(self._next_log_path(step_num), {
+            "step": step_num, "attempt": attempt, "at": self._stamp(), "model": self._model,
             "sessionId": session_id, "resumed": resume, "exitCode": exit_code, "timedOut": timed_out,
             "stdout": stdout, "stderr": stderr,
         })
@@ -410,11 +591,17 @@ class StepExecutor:
 
     # --- 검증 ---
 
+    def _ac_shell_label(self) -> str:
+        if self._ac_shell:
+            return "bash"
+        return "cmd.exe" if os.name == "nt" else "sh"
+
     def _run_ac(self, commands: list) -> tuple:
         """AC 커맨드를 순서대로 실행한다. 첫 실패에서 멈추고 출력 끝부분을 피드백으로 돌려준다."""
         for cmd in commands:
+            args, shell = ([self._ac_shell, "-c", cmd], False) if self._ac_shell else (cmd, True)
             rc, stdout, stderr, timed_out = run_killing_tree(
-                cmd, cwd=self._root, timeout=self._timeout, shell=True)
+                args, cwd=self._root, timeout=self._timeout, shell=shell)
             if timed_out:
                 return False, f"AC 실패: `{cmd}` 타임아웃({self._timeout}s)"
             if rc != 0:
@@ -422,21 +609,25 @@ class StepExecutor:
         return True, ""
 
     def _verify(self, step: dict, inv: InvokeResult) -> tuple:
-        """(status, feedback, result) 반환. status: completed | blocked | retry"""
+        """(status, feedback, result) 반환. status: completed | blocked | retry | gave_up(세션이 error 보고)"""
         result_file = self._result_file(step["step"])
         try:
-            result = self._read_json(result_file)
+            raw = self._read_json(result_file)
         except (FileNotFoundError, ValueError):
             if inv.timed_out:
                 return "retry", f"세션이 타임아웃({self._timeout}s)으로 종료됐다. 남은 작업을 이어서 마무리하라.", None
             return "retry", (f"`{result_file.name}`이 없거나 올바른 JSON이 아니다 (claude exit {inv.exit_code}).\n"
                              f"{_tail(inv.stderr, 1000)}").strip(), None
+        result, problem = parse_result(raw)
+        if problem:
+            return "retry", (f"`{result_file.name}`의 형식이 잘못됐다: {problem}. "
+                             f"종료 보고 형식대로 다시 기록하라."), None
 
-        status = result.get("status")
+        status = result["status"]
         if status == "blocked":
             return "blocked", result.get("reason", ""), result
-        if status != "completed":
-            return "retry", f"세션이 error를 보고했다: {result.get('reason', '')}", result
+        if status == "error":
+            return "gave_up", f"세션이 error를 보고했다: {result.get('reason', '')}", result
 
         ac = step.get("ac") or []
         if not ac:
@@ -458,6 +649,15 @@ class StepExecutor:
               f" | MCP: {'on' if self._mcp else 'off'}")
         if self._auto_push:
             print("  Auto-push: enabled")
+        if self._max_cost is not None or self._step_max_cost is not None:
+            # 검증 전이라 숫자가 아닐 수 있다 — 형식 오류는 _validate_index 가 안내한다
+            usd = lambda v: f"${v:.2f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else repr(v)
+            caps = [f"phase {usd(self._max_cost)}" if self._max_cost is not None else "",
+                    f"step {usd(self._step_max_cost)}" if self._step_max_cost is not None else ""]
+            print(f"  Budget: {', '.join(c for c in caps if c)}")
+        if os.name == "nt" and not self._ac_shell:
+            print("  WARN: Git Bash 를 찾지 못해 AC 를 cmd.exe 로 실행합니다. "
+                  "CLAUDE_CODE_GIT_BASH_PATH 로 bash.exe 경로를 지정하세요.")
         print(f"{'='*60}")
 
     def _check_blockers(self):
@@ -473,17 +673,50 @@ class StepExecutor:
                 print("  사유를 해결한 뒤 --reset-failed 로 다시 실행하세요.")
                 sys.exit(2)
 
-    def _validate_ac(self):
-        """미완료 step마다 ac 가 있거나, 검증 생략 사유(skip_ac)가 명시돼 있어야 한다."""
-        missing = [s for s in self._read_json(self._index_file)["steps"]
-                   if s["status"] != "completed"
-                   and not s.get("ac") and not str(s.get("skip_ac") or "").strip()]
-        if missing:
-            print("\n  ERROR: 완료 검증 커맨드(ac)가 없는 step이 있습니다.")
-            for s in missing:
-                print(f"    Step {s['step']} ({s['name']})")
-            print('  index.json에 "ac": ["npm test", ...]를 추가하세요. '
-                  '검증을 생략하려면 "skip_ac": "사유"를 명시하세요.')
+    def _validate_index(self):
+        """실행 전에 index.json 전체를 검증한다. 잘못된 설정 때문에 실행하지 않은 step 이 completed 가 되거나,
+        몇 시간 돈 뒤 그 step 차례에서야 멈추는 일을 막는다."""
+        index = self._read_json(self._index_file)
+        steps = index.get("steps")
+        problems = []
+        if not isinstance(steps, list) or not steps:
+            problems.append("steps 가 비어 있거나 배열이 아니다")
+            steps = []
+        nums = [s.get("step") if isinstance(s, dict) else None for s in steps]
+        if nums != list(range(len(steps))):
+            problems.append(f"step 번호는 0부터 빠짐·중복 없이 순서대로여야 한다 (현재: {nums})")
+        timeout = index.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            problems.append(f"timeout_sec 는 양의 정수여야 한다 (현재: {timeout!r})")
+        for key in ("max_cost_usd", "step_max_cost_usd"):
+            cap = index.get(key)
+            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0):
+                problems.append(f"{key} 는 양수여야 한다 (현재: {cap!r})")
+
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                problems.append(f"steps[{i}] 가 객체가 아니다")
+                continue
+            label = f"Step {s.get('step')} ({s.get('name')})"
+            if not isinstance(s.get("name"), str) or not s["name"].strip():
+                problems.append(f"{label}: name 이 없다")
+            if s.get("status") not in STEP_STATUSES:
+                problems.append(f"{label}: status 는 {'/'.join(STEP_STATUSES)} 중 하나여야 한다 "
+                                f"(현재: {s.get('status')!r})")
+            if s.get("status") == "completed":
+                continue
+            ac = s.get("ac")
+            if ac is not None and not (isinstance(ac, list) and all(isinstance(c, str) and c.strip() for c in ac)):
+                problems.append(f'{label}: ac 는 비어 있지 않은 커맨드 문자열의 배열이어야 한다 (예: ["npm test"])')
+            elif not ac and not str(s.get("skip_ac") or "").strip():
+                problems.append(f'{label}: 완료 검증 커맨드(ac)가 없다. 검증을 생략하려면 "skip_ac": "사유"를 명시하라')
+            if not (self._phase_dir / f"step{s.get('step')}.md").exists():
+                problems.append(f"{label}: step{s.get('step')}.md 가 없다")
+
+        if problems:
+            print("\n  ERROR: index.json 설정 오류")
+            for p in problems:
+                print(f"    - {p}")
             sys.exit(1)
 
     def _reset_failed(self):
@@ -507,16 +740,29 @@ class StepExecutor:
 
     def _stop_step(self, step: dict, status: str, message: str, attempts: int):
         step_num, step_name = step["step"], step["name"]
+        self._result_file(step_num).unlink(missing_ok=True)
+        # 중간 결과를 커밋해 두면 재실행 시 작업 트리가 깨끗하고, 다음 세션이 이어받을 수 있다.
+        self._commit_code(step_num, step_name, "wip")
         if status == "blocked":
             self._update_step(step_num, status="blocked", blocked_reason=message,
                               blocked_at=self._stamp(), attempts=attempts)
         else:
             self._update_step(step_num, status="error", error_message=message,
                               failed_at=self._stamp(), attempts=attempts)
-        self._result_file(step_num).unlink(missing_ok=True)
-        # 중간 결과를 커밋해 두면 재실행 시 작업 트리가 깨끗하고, 다음 세션이 이어받을 수 있다.
-        self._commit_step(step_num, step_name, kind="wip")
         self._update_top_index(status)
+        self._commit_meta(step_num)
+
+    def _over_budget(self, step_num: int) -> Optional[str]:
+        """비용 상한(선택)에 닿았으면 사유를 돌려준다.
+        타임아웃으로 죽은 시도는 비용이 집계되지 않으므로 실제 비용이 상한보다 클 수 있다."""
+        steps = self._read_json(self._index_file)["steps"]
+        step_cost = next(s for s in steps if s["step"] == step_num).get("cost_usd", 0.0)
+        phase_cost = sum(s.get("cost_usd", 0.0) for s in steps)
+        if self._step_max_cost is not None and step_cost >= self._step_max_cost:
+            return f"[비용 상한] step 누적 ${step_cost:.2f} ≥ step_max_cost_usd ${self._step_max_cost:.2f}"
+        if self._max_cost is not None and phase_cost >= self._max_cost:
+            return f"[비용 상한] phase 누적 ${phase_cost:.2f} ≥ max_cost_usd ${self._max_cost:.2f}"
+        return None
 
     def _add_usage(self, step_num: int, inv: InvokeResult) -> float:
         """시도별 비용·턴 수를 step에 누적한다 (재시작·재시도 포함). 누적 비용을 반환한다."""
@@ -527,6 +773,12 @@ class StepExecutor:
 
     def _execute_single_step(self, step: dict):
         step_num, step_name = step["step"], step["name"]
+        over = self._over_budget(step_num)
+        if over:
+            self._stop_step(step, "error", over, 0)
+            print(f"  ✗ Step {step_num}: {step_name} — {over}")
+            sys.exit(1)
+
         index = self._read_json(self._index_file)
         done = sum(1 for s in index["steps"] if s["status"] == "completed")
         prompt = self._build_prompt(step, index)
@@ -557,21 +809,31 @@ class StepExecutor:
             if attempt > 1:
                 tag += f" [retry {attempt}/{self.MAX_ATTEMPTS}{', resumed' if resume else ''}]"
 
+            pre_head = self._head()
+            index_snapshot = self._index_file.read_bytes()
             with progress_indicator(tag) as pi:
                 inv = self._invoke_claude(step_num, p, attempt=attempt, session_id=session_id, resume=resume)
+                self._restore_index_if_changed(index_snapshot)
                 # 재개가 즉시 실패(결과 없이 비정상 종료)하면 세션을 이어받을 수 없는 것으로 보고 새 세션으로 전환
                 resumable = not (resume and inv.exit_code != 0 and not inv.timed_out
                                  and not self._result_file(step_num).exists())
-                status, feedback, result = self._verify(step, inv)
+                git_problem = self._undo_session_git(pre_head)
+                status, feedback, result = ("error", git_problem, None) if git_problem else self._verify(step, inv)
             elapsed = int(pi.elapsed)
             cost = self._add_usage(step_num, inv)
 
+            if status == "error":  # 재시도로 풀리지 않는 문제 — 사람이 봐야 한다
+                self._stop_step(step, "error", feedback, attempt)
+                print(f"  ✗ Step {step_num}: {step_name} — {feedback}")
+                sys.exit(1)
+
             if status == "completed":
+                self._result_file(step_num).unlink(missing_ok=True)
+                self._commit_code(step_num, step_name, "feat")
                 self._update_step(step_num, status="completed", summary=result.get("summary", ""),
                                   handoff=result.get("handoff") or None,
                                   completed_at=self._stamp(), attempts=attempt)
-                self._result_file(step_num).unlink(missing_ok=True)
-                self._commit_step(step_num, step_name)
+                self._commit_meta(step_num)
                 print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s, ${cost:.2f}]")
                 return
 
@@ -581,8 +843,17 @@ class StepExecutor:
                 print(f"    Reason: {feedback}")
                 sys.exit(2)
 
+            if status == "gave_up":
+                resumable = False  # 스스로 포기한 세션을 다시 깨우지 않고 새 세션에 맡긴다
+
             first_line = feedback.splitlines()[0] if feedback else ""
             print(f"  ↻ Step {step_num}: attempt {attempt}/{self.MAX_ATTEMPTS} 실패 — {first_line}")
+
+            over = self._over_budget(step_num) if attempt < self.MAX_ATTEMPTS else None
+            if over:
+                self._stop_step(step, "error", f"{over}\n\n마지막 실패: {feedback}", attempt)
+                print(f"  ✗ Step {step_num}: {step_name} — {over}")
+                sys.exit(1)
 
         self._stop_step(step, "error", f"[{self.MAX_ATTEMPTS}회 시도 후 실패] {feedback}", self.MAX_ATTEMPTS)
         print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_ATTEMPTS} attempts")
@@ -613,8 +884,8 @@ class StepExecutor:
         self._write_json(self._index_file, index)
         self._update_top_index("completed")
 
-        self._run_git("add", "-A")
-        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+        self._stage()
+        if self._has_staged():
             self._git_commit(f"chore({self._phase_name}): mark phase completed")
 
         if self._auto_push:
@@ -636,18 +907,33 @@ def configure_stdio():
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _exit_on_signal(signum, _frame):
+    """SIGTERM·SIGHUP 을 SystemExit 로 바꾼다. 기본 동작(즉시 종료)이면 세션 프로세스 트리를 정리할 기회가 없다."""
+    sys.exit(128 + signum)
+
+
 def main():
     configure_stdio()
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _exit_on_signal)
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
     parser.add_argument("--model", help="claude --model 값 (phase index.json의 model보다 우선)")
     parser.add_argument("--reset-failed", action="store_true",
                         help="error/blocked step을 pending으로 되돌린 뒤 실행")
+    parser.add_argument("--resume", action="store_true",
+                        help="중단된 step이 남긴 커밋 안 된 변경을 세션 작업으로 보고 이어받는다")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, root=ROOT, auto_push=args.push, model=args.model).run(
-        reset_failed=args.reset_failed)
+    try:
+        StepExecutor(args.phase_dir, root=ROOT, auto_push=args.push, model=args.model).run(
+            reset_failed=args.reset_failed, resume=args.resume)
+    except KeyboardInterrupt:
+        print("\n  중단됨. 다음 명령으로 다시 실행하면 진행 중이던 step 을 이어받습니다:")
+        print(f"    python scripts/execute.py {args.phase_dir} --resume")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

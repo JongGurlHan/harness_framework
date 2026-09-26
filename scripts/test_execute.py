@@ -4,8 +4,11 @@ git·claude CLI·AC 커맨드는 모두 mock 처리하고, 상태 전이와 프�
 """
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -14,6 +17,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 import execute as ex
 
+REPO = Path(__file__).resolve().parent.parent
+PY = sys.executable.replace("\\", "/")
+AC_OK = f'"{PY}" -c "pass"'  # cmd.exe·bash·sh 어디서나 통과하는 AC
+OK = {"status": "completed", "summary": "ok"}
+
 
 def write_json(p: Path, data):
     p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -21,6 +29,63 @@ def write_json(p: Path, data):
 
 def read_json(p: Path):
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def git(root: Path, *args) -> str:
+    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def plan(root: Path, steps: list, phase: str = "p") -> Path:
+    """phases/{phase}/ 에 index.json 과 step{N}.md 를 만든다."""
+    d = root / "phases" / phase
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "index.json", {"project": "T", "phase": phase, "steps": steps})
+    for s in steps:
+        (d / f"step{s['step']}.md").write_text(f"# Step {s['step']}", encoding="utf-8")
+    return d
+
+
+def install_fake_claude(executor, runs: list) -> list:
+    """_invoke_claude 를 가짜 세션으로 바꾼다. 호출마다 runs 의 다음 원소대로 파일을 쓰고 결과를 보고한다.
+    runs 원소: {"files": {경로: 내용}, "do": 함수(root), "result": dict|None, "exit": int, "timeout": bool,
+               "raise": 예외}"""
+    calls = []
+
+    def fake(step_num, prompt, *, attempt, session_id, resume=False):
+        calls.append({"step": step_num, "prompt": prompt, "session_id": session_id, "resume": resume})
+        run = runs[len(calls) - 1]
+        for rel, text in run.get("files", {}).items():
+            p = executor._rootp / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        if "do" in run:
+            run["do"](executor._rootp)
+        if "raise" in run:
+            raise run["raise"]
+        if run.get("result") is not None:
+            write_json(executor._result_file(step_num), run["result"])
+        return ex.InvokeResult(exit_code=run.get("exit", 0), timed_out=run.get("timeout", False), stderr="")
+
+    executor._invoke_claude = fake
+    return calls
+
+
+def heartbeat_code(beat: Path) -> str:
+    """손자 프로세스를 띄우고 잠드는 자식 코드. 손자는 살아 있는 동안 beat 파일에 계속 덧붙인다."""
+    grandchild = ("import time\n"
+                  "while True:\n"
+                  f"    open({str(beat)!r}, 'a').write('.')\n"
+                  "    time.sleep(0.05)\n")
+    return f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {grandchild!r}]); time.sleep(60)"
+
+
+def assert_heartbeat_stopped(beat: Path):
+    time.sleep(0.5)
+    size = beat.stat().st_size
+    time.sleep(0.5)
+    assert beat.stat().st_size == size, "손자 프로세스가 아직 살아 있다"
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +141,7 @@ def executor(tmp_project, phase_dir):
 
 
 def make_executor(tmp_project, steps, **kw):
-    d = tmp_project / "phases" / "t"
-    d.mkdir(exist_ok=True)
-    write_json(d / "index.json", {"project": "T", "phase": "t", "steps": steps})
+    plan(tmp_project, steps, phase="t")
     return ex.StepExecutor("t", root=tmp_project, **kw)
 
 
@@ -99,6 +162,23 @@ class TestJsonHelpers:
         assert ex.StepExecutor._read_json(p) == {"k": "한글"}
 
 
+    def test_write_survives_crash_mid_write(self, tmp_path, monkeypatch):
+        # 회귀: 파일을 비운 직후 쓰기가 실패하면 index.json 이 0바이트로 남아 재시작조차 못 했다
+        p = tmp_path / "index.json"
+        ex.StepExecutor._write_json(p, {"v": 1})
+
+        def crash(self, *a, **k):
+            self.open("w").close()
+            raise OSError("disk full")
+
+        with monkeypatch.context() as m:
+            m.setattr(Path, "write_text", crash)
+            m.setattr(Path, "write_bytes", crash)
+            with pytest.raises(OSError):
+                ex.StepExecutor._write_json(p, {"v": 2})
+        assert ex.StepExecutor._read_json(p) == {"v": 1}
+
+
 class TestInit:
     def test_reads_model_and_timeout_from_index(self, tmp_project):
         d = tmp_project / "phases" / "cfg"
@@ -108,6 +188,14 @@ class TestInit:
         inst = ex.StepExecutor("cfg", root=tmp_project)
         assert inst._model == "claude-opus-5-5"
         assert inst._timeout == 7200
+
+    def test_reads_cost_caps(self, tmp_project):
+        d = tmp_project / "phases" / "cfg"
+        d.mkdir()
+        write_json(d / "index.json", {"project": "P", "phase": "cfg", "max_cost_usd": 10,
+                                      "step_max_cost_usd": 2.5, "steps": []})
+        inst = ex.StepExecutor("cfg", root=tmp_project)
+        assert inst._max_cost == 10 and inst._step_max_cost == 2.5
 
     def test_cli_model_overrides_index(self, tmp_project):
         d = tmp_project / "phases" / "cfg"
@@ -159,6 +247,12 @@ class TestBuildStepContext:
     def test_excludes_pending(self, phase_dir):
         ctx = ex.StepExecutor._build_step_context(read_json(phase_dir / "index.json"))
         assert "Step 2" not in ctx
+
+    def test_handoff_kept_without_summary(self):
+        # 회귀: summary 가 없으면 handoff 까지 통째로 빠졌다
+        ctx = ex.StepExecutor._build_step_context({"steps": [
+            {"step": 0, "name": "a", "status": "completed", "handoff": "login(email)로 시그니처 변경"}]})
+        assert "login(email)" in ctx
 
     def test_empty_when_no_completed(self):
         assert ex.StepExecutor._build_step_context({"steps": [{"step": 0, "name": "a", "status": "pending"}]}) == ""
@@ -230,14 +324,37 @@ class TestRunKillingTree:
 
     def test_timeout_kills_grandchildren(self, tmp_path):
         # 회귀: 직계 프로세스만 죽이면 파이프를 쥔 손자 프로세스가 끝날 때까지 기다리게 된다
-        code = ("import subprocess, sys, time; "
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-                "time.sleep(30)")
-        import time
+        beat = tmp_path / "beat"
         t0 = time.monotonic()
-        rc, _, _, timed_out = ex.run_killing_tree([sys.executable, "-c", code], input="",
-                                                   cwd=str(tmp_path), timeout=1)
+        rc, _, _, timed_out = ex.run_killing_tree([sys.executable, "-c", heartbeat_code(beat)], input="",
+                                                   cwd=str(tmp_path), timeout=2)
         assert timed_out and time.monotonic() - t0 < 15
+        assert_heartbeat_stopped(beat)
+
+    def test_interrupt_kills_tree_and_reraises(self, tmp_path, monkeypatch):
+        # 회귀: Ctrl+C 등 타임아웃 외의 중단에서는 자식이 살아남아 무인 세션이 계속 파일을 고쳤다.
+        # POSIX 에서는 자식이 별도 세션이라 터미널 Ctrl+C 가 자식에게 가지 않는다.
+        beat = tmp_path / "beat"
+        real = subprocess.Popen.communicate
+
+        def interrupted(self, input=None, timeout=None):
+            if timeout == 60:  # run_killing_tree 의 본 대기만 가로챈다
+                time.sleep(1.5)  # 손자가 뛰기 시작할 때까지
+                raise KeyboardInterrupt
+            return real(self, input=input, timeout=timeout)
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            ex.run_killing_tree([sys.executable, "-c", heartbeat_code(beat)], input="",
+                                cwd=str(tmp_path), timeout=60)
+        assert_heartbeat_stopped(beat)
+
+
+class TestSignalHandlers:
+    def test_sigterm_becomes_system_exit(self):
+        # SIGTERM 으로 죽을 때도 finally/except 경로를 타야 세션 프로세스 트리를 정리할 수 있다
+        with pytest.raises(SystemExit):
+            ex._exit_on_signal(15, None)
 
 
 class TestInvokeClaude:
@@ -291,6 +408,14 @@ class TestInvokeClaude:
         data = read_json(executor._phase_dir / "step2-attempt1-output.json")
         assert data["step"] == 2 and data["exitCode"] == 0 and data["sessionId"] == "sid-1"
 
+    def test_attempt_logs_not_overwritten_across_runs(self, executor):
+        # 회귀: 재실행하면 attempt 번호가 1부터 다시 시작해 이전 실행의 실패 로그를 덮어썼다
+        for out in ("RUN-1", "RUN-2"):
+            with patch.object(ex, "run_killing_tree", return_value=(0, out, "", False)):
+                executor._invoke_claude(2, "P", attempt=1, session_id="s")
+        logs = sorted(executor._phase_dir.glob("step2-attempt*-output.json"))
+        assert [read_json(p)["stdout"] for p in logs] == ["RUN-1", "RUN-2"]
+
     def test_parses_cost_and_turns(self, executor):
         stdout = '{"result": "ok", "total_cost_usd": 0.2008, "num_turns": 9}'
         with patch.object(ex, "run_killing_tree", return_value=(0, stdout, "", False)):
@@ -319,6 +444,7 @@ class TestInvokeClaude:
 
 class TestRunAc:
     def test_all_pass(self, executor):
+        executor._ac_shell = None
         with patch.object(ex, "run_killing_tree", return_value=(0, "ok", "", False)) as m:
             ok, fb = executor._run_ac(["a", "b"])
         assert ok and fb == "" and m.call_count == 2
@@ -338,33 +464,128 @@ class TestRunAc:
         assert not ok and "타임아웃" in fb
 
 
-class TestValidateAc:
-    def test_missing_ac_exits(self, tmp_project):
-        inst = make_executor(tmp_project, [{"step": 0, "name": "a", "status": "pending"}])
+class TestAcShell:
+    def test_posix_uses_default_shell(self):
+        assert ex.resolve_ac_shell(is_windows=False) is None
+
+    def test_env_override(self, tmp_path, monkeypatch):
+        bash = tmp_path / "bash.exe"
+        bash.write_text("")
+        monkeypatch.setenv("CLAUDE_CODE_GIT_BASH_PATH", str(bash))
+        assert ex.resolve_ac_shell(is_windows=True) == str(bash)
+
+    def test_env_override_to_missing_file_is_ignored(self, tmp_path, monkeypatch):
+        # 없는 경로를 쓰면 AC 실행 때 트레이스백으로 죽는다
+        monkeypatch.setenv("CLAUDE_CODE_GIT_BASH_PATH", str(tmp_path / "nope" / "bash.exe"))
+        with patch("shutil.which", return_value=None):
+            assert ex.resolve_ac_shell(is_windows=True) is None
+
+    @pytest.mark.parametrize("git_rel", ["cmd/git.exe", "mingw64/bin/git.exe"])
+    def test_finds_git_bash_next_to_git(self, tmp_path, monkeypatch, git_rel):
+        monkeypatch.delenv("CLAUDE_CODE_GIT_BASH_PATH", raising=False)
+        bash = tmp_path / "Git" / "bin" / "bash.exe"
+        bash.parent.mkdir(parents=True)
+        bash.write_text("")
+        with patch("shutil.which", return_value=str(tmp_path / "Git" / git_rel)):
+            assert ex.resolve_ac_shell(is_windows=True) == str(bash)
+
+    def test_no_git_bash(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_GIT_BASH_PATH", raising=False)
+        with patch("shutil.which", return_value=str(tmp_path / "git.exe")):
+            assert ex.resolve_ac_shell(is_windows=True) is None
+
+    def test_run_ac_uses_resolved_shell(self, executor):
+        executor._ac_shell = "/x/bash"
+        with patch.object(ex, "run_killing_tree", return_value=(0, "", "", False)) as m:
+            executor._run_ac(["FOO=1 npm test"])
+        assert m.call_args[0][0] == ["/x/bash", "-c", "FOO=1 npm test"]
+        assert m.call_args[1]["shell"] is False
+
+    def test_prompt_names_ac_shell(self, executor):
+        executor._ac_shell = "/x/bash"
+        index = read_json(executor._index_file)
+        assert "`bash`" in executor._build_prompt(index["steps"][2], index)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows 전용")
+    def test_bash_syntax_ac_passes_on_windows(self, executor):
+        # 회귀: 세션(Git Bash)에서 통과한 AC 가 하네스(cmd.exe)에서는 실패해 시도만 소모했다
+        executor._ac_shell = ex.resolve_ac_shell()
+        ok, fb = executor._run_ac(['[ "$(echo hi)" = hi ]'])
+        assert ok, fb
+
+
+class TestValidateIndex:
+    def _assert_rejected(self, tmp_project, steps, **index_fields):
+        inst = make_executor(tmp_project, steps)
+        if index_fields:
+            idx = read_json(inst._index_file)
+            idx.update(index_fields)
+            write_json(inst._index_file, idx)
         with pytest.raises(SystemExit) as e:
-            inst._validate_ac()
+            inst._validate_index()
         assert e.value.code == 1
 
+    def test_missing_ac_exits(self, tmp_project):
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending"}])
+
     def test_empty_ac_exits(self, tmp_project):
-        inst = make_executor(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": []}])
-        with pytest.raises(SystemExit):
-            inst._validate_ac()
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": []}])
 
     def test_blank_skip_reason_exits(self, tmp_project):
-        inst = make_executor(tmp_project, [{"step": 0, "name": "a", "status": "pending", "skip_ac": " "}])
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "skip_ac": " "}])
+
+    @pytest.mark.parametrize("ac", [[""], ["  "], "npm test", [["npm", "test"]]])
+    def test_malformed_ac_exits(self, tmp_project, ac):
+        # 회귀: [""] 는 검증을 통과했고 실행하면 exit 0 이라 아무것도 확인하지 않고 completed 가 됐다
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": ac}])
+
+    def test_duplicate_step_numbers_exit(self, tmp_project):
+        # 회귀: step 0 이 둘이면 한 번 실행으로 둘 다 completed 가 됐다
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": ["x"]},
+                                            {"step": 0, "name": "b", "status": "pending", "ac": ["x"]}])
+
+    def test_gap_in_step_numbers_exits(self, tmp_project):
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": ["x"]},
+                                            {"step": 2, "name": "b", "status": "pending", "ac": ["x"]}])
+
+    def test_unknown_status_exits(self, tmp_project):
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "in_progress", "ac": ["x"]}])
+
+    def test_empty_steps_exits(self, tmp_project):
+        self._assert_rejected(tmp_project, [])
+
+    @pytest.mark.parametrize("timeout", ["3600", 0, -1])
+    def test_invalid_timeout_exits(self, tmp_project, timeout):
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": ["x"]}],
+                              timeout_sec=timeout)
+
+    @pytest.mark.parametrize("field, value", [
+        ("max_cost_usd", "10"), ("max_cost_usd", 0), ("step_max_cost_usd", -1), ("step_max_cost_usd", True),
+    ])
+    def test_invalid_cost_cap_exits(self, tmp_project, field, value):
+        self._assert_rejected(tmp_project, [{"step": 0, "name": "a", "status": "pending", "ac": ["x"]}],
+                              **{field: value})
+
+    def test_missing_step_file_exits(self, tmp_project):
+        # 몇 시간 돈 뒤 그 step 차례에서야 멈추지 않도록 시작 전에 확인한다
+        inst = make_executor(tmp_project, [{"step": 0, "name": "a", "status": "completed"},
+                                           {"step": 1, "name": "b", "status": "pending", "ac": ["x"]}])
+        (inst._phase_dir / "step1.md").unlink()
         with pytest.raises(SystemExit):
-            inst._validate_ac()
+            inst._validate_index()
 
     def test_explicit_skip_ok(self, tmp_project):
         make_executor(tmp_project, [
             {"step": 0, "name": "a", "status": "pending", "skip_ac": "문서만 수정"},
-        ])._validate_ac()
+        ])._validate_index()
 
     def test_completed_steps_ignored(self, tmp_project):
-        make_executor(tmp_project, [
+        inst = make_executor(tmp_project, [
             {"step": 0, "name": "a", "status": "completed"},
             {"step": 1, "name": "b", "status": "pending", "ac": ["npm test"]},
-        ])._validate_ac()
+        ])
+        (inst._phase_dir / "step0.md").unlink()  # 끝난 step 은 파일이 없어도 된다
+        inst._validate_index()
 
 
 class TestVerify:
@@ -410,15 +631,34 @@ class TestVerify:
         status, fb, _ = executor._verify(self._step(executor), self._inv())
         assert status == "blocked" and "API 키" in fb
 
-    def test_model_error_is_retry(self, executor):
+    def test_model_error_is_gave_up(self, executor):
         self._write_result(executor, {"status": "error", "reason": "원인 불명"})
         status, fb, _ = executor._verify(self._step(executor), self._inv())
-        assert status == "retry" and "원인 불명" in fb
+        assert status == "gave_up" and "원인 불명" in fb
 
     def test_invalid_json_is_retry(self, executor):
         executor._result_file(2).write_text("{not json", encoding="utf-8")
         status, _, _ = executor._verify(self._step(executor), self._inv())
         assert status == "retry"
+
+    @pytest.mark.parametrize("raw", [
+        [],                                               # 객체가 아님
+        "completed",
+        {"status": "done", "summary": "s"},               # 알 수 없는 status
+        {"status": "completed", "summary": {"a": 1}},     # 문자열이 아닌 summary
+        {"status": "completed", "summary": "s", "handoff": {"k": "v"}},
+    ])
+    def test_malformed_result_is_retry_with_feedback(self, executor, raw):
+        # 회귀: 문법상 유효한 JSON 이라도 형태가 다르면 result.get() 에서 하네스 전체가 죽었다
+        self._write_result(executor, raw)
+        status, fb, _ = executor._verify(self._step(executor), self._inv())
+        assert status == "retry" and "형식" in fb
+
+    def test_handoff_list_is_joined(self, executor):
+        self._write_result(executor, {"status": "completed", "summary": "s", "handoff": ["결정1", "결정2"]})
+        with patch.object(executor, "_run_ac", return_value=(True, "")):
+            status, _, result = executor._verify(self._step(executor), self._inv())
+        assert status == "completed" and result["handoff"] == "결정1\n결정2"
 
     def test_skip_ac_with_clean_exit_completes(self, executor):
         self._write_result(executor, {"status": "completed", "summary": "s"})
@@ -535,6 +775,41 @@ class TestExecuteSingleStep:
         assert calls[2]["saved_session_id"] == calls[2]["session_id"]
         assert "UI를 구현하세요" in calls[2]["prompt"] and "이전 시도" in calls[2]["prompt"]
 
+    def test_session_error_report_retries_in_new_session(self, executor):
+        # 스스로 포기한 세션을 다시 깨우지 않고 새 세션에 맡긴다
+        calls = self._fake_invoke(executor, [{"result": {"status": "error", "reason": "막힘: X"}}, self.OK])
+        with patch.object(executor, "_run_ac", return_value=(True, "")):
+            executor._execute_single_step(self._step(executor))
+        assert calls[1]["resume"] is False and calls[1]["session_id"] != calls[0]["session_id"]
+        assert "UI를 구현하세요" in calls[1]["prompt"] and "막힘: X" in calls[1]["prompt"]
+
+    def test_step_cost_cap_stops_retries(self, executor):
+        executor._step_max_cost = 0.5
+        calls = self._fake_invoke(executor, [dict(self.OK, cost=0.3)] * 3)
+        with patch.object(executor, "_run_ac", return_value=(False, "AC 실패: x")):
+            with pytest.raises(SystemExit) as e:
+                executor._execute_single_step(self._step(executor))
+        assert e.value.code == 1 and len(calls) == 2
+        s = read_json(executor._index_file)["steps"][2]
+        assert s["status"] == "error" and "비용 상한" in s["error_message"]
+
+    def test_phase_cost_cap_stops_before_starting(self, executor):
+        executor._max_cost = 1.0
+        executor._update_step(0, cost_usd=0.7)
+        executor._update_step(1, cost_usd=0.5)  # 앞선 step 들이 이미 예산을 다 썼다
+        calls = self._fake_invoke(executor, [self.OK])
+        with pytest.raises(SystemExit):
+            executor._execute_single_step(self._step(executor))
+        assert calls == []
+        assert "비용 상한" in read_json(executor._index_file)["steps"][2]["error_message"]
+
+    def test_completed_step_not_failed_by_cap(self, executor):
+        executor._step_max_cost = 0.1
+        self._fake_invoke(executor, [dict(self.OK, cost=0.5)])
+        with patch.object(executor, "_run_ac", return_value=(True, "")):
+            executor._execute_single_step(self._step(executor))
+        assert read_json(executor._index_file)["steps"][2]["status"] == "completed"
+
     def test_interrupted_run_resumes_saved_session(self, executor):
         executor._update_step(2, session_id="old-sess", started_at="t")
         calls = self._fake_invoke(executor, [self.OK])
@@ -578,8 +853,9 @@ class TestExecuteSingleStep:
 
     def test_failed_step_changes_are_committed_as_wip(self, executor):
         msgs = []
-        executor._git_commit = lambda msg: msgs.append(msg)
-        executor._run_git = MagicMock(return_value=MagicMock(returncode=1, stdout="", stderr=""))
+        executor._git_commit = lambda msg, *paths: msgs.append(msg)
+        executor._run_git = lambda *a: MagicMock(returncode=1 if a[:3] == ("diff", "--cached", "--quiet") else 0,
+                                                 stdout="", stderr="")
         self._fake_invoke(executor, [{"result": {"status": "blocked", "reason": "r"}}])
         with pytest.raises(SystemExit):
             executor._execute_single_step(self._step(executor))
@@ -752,53 +1028,69 @@ class TestCheckoutBranch:
 
 
 class TestCommitStep:
-    def _record(self, executor, diff_rcs):
-        calls = []
-        rcs = iter(diff_rcs)
+    """실제 git 으로 커밋 분리를 확인한다."""
 
-        def fake_git(*args):
-            calls.append(args)
-            if args[:2] == ("diff", "--cached"):
-                return MagicMock(returncode=next(rcs, 0))
-            return MagicMock(returncode=0, stdout="", stderr="")
+    def _executor(self, repo):
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "plan")
+        return ex.StepExecutor("p", root=repo)
 
-        executor._run_git = fake_git
-        return calls
+    def test_code_commit_excludes_phase_index(self, repo):
+        e = self._executor(repo)
+        (repo / "src").mkdir()
+        (repo / "src" / "a.ts").write_text("x", encoding="utf-8")
+        e._update_step(0, session_id="s")
+        e._commit_code(0, "a", "feat")
+        assert commit_files(repo, "feat(p)") == ["src/a.ts"]
+        e._commit_meta(0)
+        assert commit_files(repo, "chore(p): step 0") == ["phases/p/index.json"]
+        assert git(repo, "status", "--porcelain") == ""
 
-    def test_two_phase_commit(self, executor):
-        calls = self._record(executor, [1, 1])
-        executor._commit_step(2, "ui")
-        msgs = [c[2] for c in calls if c[0] == "commit"]
-        assert msgs[0].startswith("feat(mvp):") and msgs[1].startswith("chore(mvp):")
+    def test_no_code_changes_skips_code_commit(self, repo):
+        e = self._executor(repo)
+        e._update_step(0, session_id="s")
+        e._commit_code(0, "a", "feat")
+        assert git(repo, "log", "--format=%s", "--grep=^feat").strip() == ""
+        assert git(repo, "status", "--porcelain").strip() == "M phases/p/index.json"
 
-    def test_no_code_changes_skips_feat_commit(self, executor):
-        calls = self._record(executor, [0, 1])
-        executor._commit_step(2, "ui")
-        msgs = [c[2] for c in calls if c[0] == "commit"]
-        assert len(msgs) == 1 and msgs[0].startswith("chore")
+    def test_wip_prefix(self, repo):
+        e = self._executor(repo)
+        (repo / "a.txt").write_text("x", encoding="utf-8")
+        e._commit_code(0, "a", "wip")
+        assert git(repo, "log", "-1", "--format=%s").startswith("wip(p): step 0")
 
-    def test_wip_prefix(self, executor):
-        calls = self._record(executor, [1, 1])
-        executor._commit_step(2, "ui", kind="wip")
-        msgs = [c[2] for c in calls if c[0] == "commit"]
-        assert msgs[0].startswith("wip(mvp):")
+    def test_plan_commit_leaves_other_staged_changes(self, repo):
+        # 중단된 세션의 작업이 스테이징돼 있어도 계획 커밋에는 phases/ 만 들어간다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        (repo / "half.ts").write_text("x", encoding="utf-8")
+        git(repo, "add", "half.ts")
+        ex.StepExecutor("p", root=repo)._commit_plan_files()
+        assert all(f.startswith("phases/") for f in commit_files(repo, "chore(p): phase plan"))
+        assert git(repo, "status", "--porcelain").strip() == "?? half.ts"  # 작업은 트리에 남는다
 
     def test_commit_failure_exits(self, executor):
         def fake_git(*args):
-            if args[:2] == ("diff", "--cached"):
+            if args[:3] == ("diff", "--cached", "--quiet"):
                 return MagicMock(returncode=1)
             if args[0] == "commit":
                 return MagicMock(returncode=1, stdout="", stderr="hook failed")
             return MagicMock(returncode=0, stdout="", stderr="")
         executor._run_git = fake_git
         with pytest.raises(SystemExit) as e:
-            executor._commit_step(2, "ui")
+            executor._commit_code(2, "ui", "feat")
         assert e.value.code == 1
 
 
 # ---------------------------------------------------------------------------
 # top-level index
 # ---------------------------------------------------------------------------
+
+    def test_diff_error_is_not_treated_as_no_changes(self, executor):
+        # git diff --quiet 는 0=변경 없음, 1=변경 있음, 그 외=오류다
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=128, stdout="", stderr="fatal: bad"))
+        with pytest.raises(SystemExit):
+            executor._has_staged()
 
 class TestUpdateTopIndex:
     def test_completed(self, executor, top_index):
@@ -852,9 +1144,352 @@ class TestMainCli:
                 ex.main()
             assert e.value.code == 1
 
+    def test_ctrl_c_exits_130_with_resume_hint(self, tmp_project, phase_dir, capsys):
+        with patch("sys.argv", ["execute.py", "0-mvp"]), patch.object(ex, "ROOT", tmp_project), \
+                patch.object(ex.StepExecutor, "run", side_effect=KeyboardInterrupt):
+            with pytest.raises(SystemExit) as e:
+                ex.main()
+        assert e.value.code == 130 and "0-mvp --resume" in capsys.readouterr().out
+
+    def test_resume_flag_passed_to_run(self, tmp_project, phase_dir):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--resume"]), patch.object(ex, "ROOT", tmp_project), \
+                patch.object(ex.StepExecutor, "run") as run:
+            ex.main()
+        assert run.call_args.kwargs["resume"] is True
+
     def test_missing_index_exits(self, tmp_project):
         (tmp_project / "phases" / "empty").mkdir()
         with patch("sys.argv", ["execute.py", "empty"]), patch.object(ex, "ROOT", tmp_project):
             with pytest.raises(SystemExit) as e:
                 ex.main()
             assert e.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# 통합: 실제 git 저장소에서 run() 전체 경로
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def repo(tmp_path):
+    """실제 git 저장소. 하네스 템플릿의 .gitignore 를 쓰고 main 에 초기 커밋이 있다."""
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "t")
+    git(tmp_path, "config", "commit.gpgsign", "false")
+    shutil.copy(REPO / ".gitignore", tmp_path / ".gitignore")
+    (tmp_path / "README.md").write_text("x", encoding="utf-8")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "init")
+    return tmp_path
+
+
+def commit_files(root: Path, subject_prefix: str) -> list:
+    """제목이 subject_prefix 로 시작하는 가장 최근 커밋의 파일 목록."""
+    sha = git(root, "log", "-1", "--format=%H", f"--grep=^{subject_prefix}")
+    assert sha.strip(), f"'{subject_prefix}' 커밋이 없다"
+    return git(root, "show", "--name-only", "--format=", sha.strip()).split()
+
+
+class TestRunInterrupted:
+    """하네스가 세션 도중 죽은 뒤 다시 실행하는 경로 (harness.md '중단 복구')."""
+
+    def _interrupted(self, repo, with_changes=True):
+        d = plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        git(repo, "checkout", "-q", "-b", "feat-p")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "chore(p): phase plan")
+        idx = read_json(d / "index.json")
+        idx["steps"][0].update(session_id="sess-1", started_at="t")
+        write_json(d / "index.json", idx)
+        if with_changes:
+            (repo / "src").mkdir()
+            (repo / "src" / "half.ts").write_text("// half", encoding="utf-8")  # 세션이 하다 만 작업
+
+    def test_resumes_interrupted_step_with_its_changes(self, repo):
+        self._interrupted(repo)
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"files": {"src/half.ts": "// done"}, "result": OK}])
+        e.run(resume=True)
+        assert calls[0]["resume"] and calls[0]["session_id"] == "sess-1"
+        assert "src/half.ts" in commit_files(repo, "feat(p)")
+        assert git(repo, "status", "--porcelain") == ""
+
+    def test_interrupted_dirty_tree_requires_resume_flag(self, repo, capsys):
+        # 회귀: 중단 뒤 사용자가 만든 파일까지 세션 작업으로 보고 feat 커밋에 넣었다.
+        # 남은 변경을 보여 주고, --resume 으로 확인받은 뒤에만 이어받는다.
+        self._interrupted(repo)
+        (repo / "user-notes.txt").write_text("메모", encoding="utf-8")
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        out = capsys.readouterr().out
+        assert se.value.code == 1 and calls == []
+        assert "src/half.ts" in out and "user-notes.txt" in out and "--resume" in out
+
+    def test_interrupted_clean_tree_resumes_without_flag(self, repo):
+        # 남은 변경이 없으면 섞일 것도 없으니 그냥 다시 실행하면 된다
+        self._interrupted(repo, with_changes=False)
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        e.run()
+        assert calls[0]["resume"] and calls[0]["session_id"] == "sess-1"
+
+    def test_user_changes_without_interrupted_step_still_refused(self, repo):
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        (repo / "notes.txt").write_text("사용자 작업", encoding="utf-8")
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        assert se.value.code == 1 and calls == []
+
+    def test_interrupted_step_on_other_branch_still_refused(self, repo):
+        # 중단 흔적이 있어도 지금 브랜치가 phase 브랜치가 아니면 그 변경은 세션 작업이라고 볼 수 없다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK],
+                     "session_id": "sess-1", "started_at": "t"}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "plan on main")
+        (repo / "notes.txt").write_text("사용자 작업", encoding="utf-8")
+        assert git(repo, "branch", "--show-current").strip() == "main"
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        with pytest.raises(SystemExit):
+            e.run()
+        assert calls == []
+
+    def test_crash_while_committing_success_can_resume(self, repo):
+        # 성공한 step 을 커밋하는 도중 죽어도, 다시 실행하면 이어서 completed 가 된다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"files": {"src/a.ts": "x"}, "result": OK}])
+        real_commit = e._git_commit
+
+        def crash_on_feat(msg, *paths):
+            if msg.startswith("feat("):
+                raise KeyboardInterrupt
+            real_commit(msg, *paths)
+
+        e._git_commit = crash_on_feat
+        with pytest.raises(KeyboardInterrupt):
+            e.run()
+
+        e2 = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e2, [{"result": OK}])
+        e2.run(resume=True)
+        assert read_json(e2._index_file)["steps"][0]["status"] == "completed"
+        assert "src/a.ts" in commit_files(repo, "feat(p)")
+        assert git(repo, "status", "--porcelain") == ""
+
+    def test_blocked_leaves_clean_tree_including_top_index(self, repo):
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        write_json(repo / "phases" / "index.json", {"phases": [{"dir": "p", "status": "pending"}]})
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"files": {"src/a.ts": "x"},
+                                 "result": {"status": "blocked", "reason": "API 키"}}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        assert se.value.code == 2
+        assert read_json(repo / "phases" / "index.json")["phases"][0]["status"] == "blocked"
+        assert git(repo, "status", "--porcelain") == ""
+
+
+class TestRunSessionReports:
+    def test_handoff_list_does_not_stall_next_step(self, repo):
+        # 회귀: handoff 배열이 index.json 에 그대로 저장돼, 다음 step 프롬프트 생성에서 매번 죽었다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]},
+                    {"step": 1, "name": "b", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [
+            {"result": {"status": "completed", "summary": "s", "handoff": ["결정1", "결정2"]}},
+            {"result": OK},
+        ])
+        e.run()
+        assert len(calls) == 2 and "결정2" in calls[1]["prompt"]
+        assert read_json(e._index_file)["steps"][0]["handoff"] == "결정1\n결정2"
+
+
+# ---------------------------------------------------------------------------
+# 비밀값 파일
+# ---------------------------------------------------------------------------
+
+class TestGitignore:
+    @pytest.mark.parametrize("path, ignored", [
+        (".env", True), (".env.local", True), ("app/.env.production", True), (".env.example", False),
+        ("phases/0-mvp/index.json.tmp", True),
+    ])
+    def test_env_files(self, path, ignored):
+        r = subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=REPO)
+        assert (r.returncode == 0) == ignored
+
+
+class TestIsSecretPath:
+    @pytest.mark.parametrize("path", [
+        ".env", ".env.local", "config/.env.production", ".envrc", "certs/server.pem", "deploy.key", "id_rsa",
+    ])
+    def test_detected(self, path):
+        assert ex.is_secret_path(path)
+
+    @pytest.mark.parametrize("path", [".env.example", "src/env.ts", "environment.md", "keys.ts", "docs/.envrc.md"])
+    def test_not_detected(self, path):
+        assert not ex.is_secret_path(path)
+
+
+class TestRunSecrets:
+    def test_secret_files_never_committed(self, repo, capsys):
+        # 대상 프로젝트의 .gitignore 에 .env 규칙이 없어도 하네스 자동 커밋에는 들어가지 않는다
+        (repo / ".gitignore").write_text("phases/**/step*-output.json\nphases/**/step*-result.json\n",
+                                         encoding="utf-8")
+        git(repo, "commit", "-qam", "project gitignore")
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"files": {"src/a.ts": "x", ".env.local": "API_KEY=secret"}, "result": OK}])
+        e.run()
+        committed = git(repo, "log", "--all", "--name-only", "--format=")
+        assert "src/a.ts" in committed and ".env.local" not in committed
+        assert ".env.local" in capsys.readouterr().out
+
+
+    def test_secret_in_phases_not_in_plan_commit(self, repo):
+        # 회귀: 계획 커밋은 비밀값 필터를 거치지 않았다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        (repo / "phases" / "p" / "deploy.pem").write_text("KEY", encoding="utf-8")
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"result": OK}])
+        e.run()
+        assert "phases/p/deploy.pem" not in git(repo, "log", "--all", "--name-only", "--format=")
+
+    def test_deleting_tracked_secret_is_committed(self, repo):
+        # 회귀: 비밀값 파일을 지우는 변경까지 커밋에서 빼서 HEAD 에 남았다
+        (repo / "deploy.pem").write_text("KEY", encoding="utf-8")
+        git(repo, "add", "-f", "deploy.pem")
+        git(repo, "commit", "-qm", "pem")
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"do": lambda root: (root / "deploy.pem").unlink(), "result": OK}])
+        e.run()
+        assert "deploy.pem" not in git(repo, "ls-tree", "--name-only", "HEAD")
+        assert git(repo, "status", "--porcelain") == ""
+
+class TestRunBranchConfig:
+    def test_validates_config_of_phase_branch(self, repo):
+        # 회귀: 브랜치 전환 전의 index.json 으로 검증하고, 전환 뒤의 다른 index.json 으로 실행했다
+        plan(repo, [{"step": 0, "name": "a", "status": "pending"}])  # ac 없음
+        git(repo, "checkout", "-q", "-b", "feat-p")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "plan without ac")
+        git(repo, "checkout", "-q", "main")
+        plan(repo, [{"step": 0, "name": "a", "status": "completed"}])  # main 에서는 끝난 것처럼 보인다
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "completed on main")
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        assert se.value.code == 1 and calls == []
+
+    def test_reset_failed_applies_to_phase_branch(self, repo):
+        # --reset-failed 는 실행할 브랜치의 index.json 을 고쳐야 한다
+        plan(repo, [{"step": 0, "name": "a", "status": "error", "ac": [AC_OK], "error_message": "x"}])
+        git(repo, "checkout", "-q", "-b", "feat-p")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "failed run")
+        git(repo, "checkout", "-q", "main")
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "plan on main")
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"result": OK}])
+        e.run(reset_failed=True)
+        assert len(calls) == 1
+        assert read_json(e._index_file)["steps"][0]["status"] == "completed"
+        assert "error_message" not in read_json(e._index_file)["steps"][0]
+
+class TestRunSessionGit:
+    def test_session_commit_is_undone_and_recommitted(self, repo):
+        # 세션은 커밋하지 않는다는 규칙을 하네스가 강제한다. 변경은 남기고 커밋만 되돌린다.
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+
+        def session_commits(root):
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "session commit")
+
+        install_fake_claude(e, [{"files": {"src/a.ts": "x"}, "do": session_commits, "result": OK}])
+        e.run()
+        assert "session commit" not in git(repo, "log", "--format=%s")
+        assert "src/a.ts" in commit_files(repo, "feat(p)")
+        assert git(repo, "status", "--porcelain") == ""
+
+    def test_session_branch_switch_fails_step(self, repo):
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"files": {"src/a.ts": "x"},
+                                 "do": lambda root: git(root, "checkout", "-q", "-b", "other"), "result": OK}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        assert se.value.code == 1
+        assert git(repo, "branch", "--show-current").strip() == "feat-p"
+        s = read_json(e._index_file)["steps"][0]
+        assert s["status"] == "error" and "other" in s["error_message"]
+        assert "src/a.ts" in commit_files(repo, "wip(p)")
+
+
+class TestRunFailures:
+    def test_git_failure_stops_instead_of_completing(self, repo, capsys):
+        # 회귀: index.lock 때문에 git add 가 실패해도 무시하고 step·phase 를 completed 로 기록했다.
+        # 하네스가 타임아웃으로 세션을 죽일 때 세션의 git 이 같이 죽으면 이 lock 이 남는다.
+        plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        lock = repo / ".git" / "index.lock"
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"files": {"app.py": "print(1)"}, "do": lambda root: lock.write_text(""),
+                                 "result": OK}])
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        out = capsys.readouterr().out
+        assert se.value.code == 1 and "completed!" not in out and "index.lock" in out
+        assert read_json(e._index_file)["steps"][0]["status"] == "pending"
+
+        lock.unlink()  # 원인을 치우고 이어서 실행하면 완료된다
+        e2 = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e2, [{"result": OK}])
+        e2.run(resume=True)
+        assert "app.py" in commit_files(repo, "feat(p)")
+
+    def test_invalid_cost_cap_reports_config_error(self, repo, capsys):
+        # 회귀: 설정 검증 전에 헤더가 비용을 숫자로 출력하다 ValueError 로 죽었다
+        d = plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        idx = read_json(d / "index.json")
+        idx["max_cost_usd"] = "10"
+        write_json(d / "index.json", idx)
+        e = ex.StepExecutor("p", root=repo)
+        with pytest.raises(SystemExit) as se:
+            e.run()
+        assert se.value.code == 1 and "max_cost_usd" in capsys.readouterr().out
+
+
+class TestRunSessionState:
+    """index.json 은 하네스만 쓴다. 세션이 고친 내용은 되돌린다."""
+
+    def test_session_cannot_mark_other_steps_completed(self, repo, capsys):
+        # 회귀: 세션이 index.json 에서 뒤 step 을 completed 로 바꾸면 그 step 은 실행도 AC 검증도 없이 넘어갔다
+        d = plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]},
+                        {"step": 1, "name": "b", "status": "pending", "ac": [AC_OK]}])
+
+        def tamper(root):
+            idx = read_json(d / "index.json")
+            idx["steps"][1]["status"] = "completed"
+            write_json(d / "index.json", idx)
+
+        e = ex.StepExecutor("p", root=repo)
+        calls = install_fake_claude(e, [{"do": tamper, "result": OK}, {"result": OK}])
+        e.run()
+        assert [c["step"] for c in calls] == [0, 1]
+        assert "index.json" in capsys.readouterr().out
+
+    def test_session_deleting_index_is_restored(self, repo):
+        d = plan(repo, [{"step": 0, "name": "a", "status": "pending", "ac": [AC_OK]}])
+        e = ex.StepExecutor("p", root=repo)
+        install_fake_claude(e, [{"do": lambda root: (d / "index.json").unlink(), "result": OK}])
+        e.run()
+        assert read_json(d / "index.json")["steps"][0]["status"] == "completed"

@@ -4,10 +4,15 @@ out/
 next-env.d.ts
 tsconfig.tsbuildinfo
 
+# env / secrets — 하네스는 git add -A 로 자동 커밋한다
+.env
+.env.*
+!.env.example
+
 # phase execution outputs
-phases/**/phase*-output.json
 phases/**/step*-output.json
 phases/**/step*-result.json
+phases/**/*.tmp
 
 # python / local
 __pycache__/
